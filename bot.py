@@ -37,6 +37,14 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 BASE_URL = os.environ["BASE_URL"].rstrip("/")
 MODEL = os.environ.get("OPENAI_MODEL", "gemini-3.5-flash")
+# If the primary model is overloaded/unavailable, try these in order before
+# giving up. Keeps the bot answering during Gemini free-tier congestion.
+_FALLBACK_ENV = os.environ.get("OPENAI_FALLBACK_MODELS", "")
+FALLBACK_MODELS = [m.strip() for m in _FALLBACK_ENV.split(",") if m.strip()] or [
+    "gemini-flash-latest",
+    "gemini-2.5-flash-lite",
+]
+CANDIDATE_MODELS = [MODEL] + [m for m in FALLBACK_MODELS if m != MODEL]
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 LOG_PATH = "/tmp/run.jsonl"
@@ -214,10 +222,10 @@ def agent_reply(chat_id: int, user_text: str) -> dict:
         time_left = deadline - time.time()
         use_tools = time_left > 15  # leave headroom to force a final answer
 
-        kwargs = dict(model=MODEL, messages=messages)
+        kwargs_base = dict(messages=messages)
         if use_tools:
-            kwargs["tools"] = TOOLS
-            kwargs["tool_choice"] = "auto"
+            kwargs_base["tools"] = TOOLS
+            kwargs_base["tool_choice"] = "auto"
         else:
             # Past budget: force a plain-text final answer, no more tool calls.
             messages.append(
@@ -230,16 +238,61 @@ def agent_reply(chat_id: int, user_text: str) -> dict:
                 }
             )
 
-        log_event({"chat_id": chat_id, "type": "llm_call_start", "step": step})
-        try:
-            resp = client.chat.completions.create(**kwargs)
-        except Exception:
+        log_event(
+            {
+                "chat_id": chat_id,
+                "type": "llm_call_start",
+                "step": step,
+                "candidates": CANDIDATE_MODELS,
+            }
+        )
+        resp = None
+        last_err = None
+        for model_name in CANDIDATE_MODELS:
+            if time.time() >= deadline - 5:
+                break
+            kwargs = dict(kwargs_base, model=model_name)
+            for attempt in range(2):  # 2 tries per model before moving on
+                try:
+                    resp = client.chat.completions.create(**kwargs)
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    log_event(
+                        {
+                            "chat_id": chat_id,
+                            "type": "llm_call_retry",
+                            "step": step,
+                            "model": model_name,
+                            "attempt": attempt,
+                            "error": str(e),
+                        }
+                    )
+                    remaining = deadline - time.time()
+                    if remaining < 10:
+                        break
+                    time.sleep(min(4 * (attempt + 1), remaining - 5))
+            if resp is not None:
+                if model_name != MODEL:
+                    log_event(
+                        {
+                            "chat_id": chat_id,
+                            "type": "llm_call_fallback_used",
+                            "step": step,
+                            "model": model_name,
+                        }
+                    )
+                break
+        if resp is None:
             log_event(
                 {
                     "chat_id": chat_id,
                     "type": "llm_call_error",
                     "step": step,
-                    "error": traceback.format_exc(),
+                    "error": traceback.format_exc()
+                    if last_err is None
+                    else repr(last_err),
                 }
             )
             final_text = '{"answer": "internal error: llm call failed"}'
