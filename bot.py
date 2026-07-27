@@ -36,7 +36,7 @@ from openai import OpenAI
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 BASE_URL = os.environ["BASE_URL"].rstrip("/")
-MODEL = os.environ.get("OPENAI_MODEL", "gemini-2.5-flash")
+MODEL = os.environ.get("OPENAI_MODEL", "gemini-3.5-flash")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 LOG_PATH = "/tmp/run.jsonl"
