@@ -49,9 +49,13 @@ HISTORY_TURNS_PER_CHAT = 20
 
 # Gemini's free-tier API is OpenAI-compatible, so we just point the OpenAI
 # client at Google's endpoint instead of paying for OpenAI directly.
+# timeout is explicit: without it, a hung/slow upstream call can block a
+# chat forever with no error and no reply (silent stall).
 client = OpenAI(
     api_key=GEMINI_API_KEY,
     base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+    timeout=60.0,
+    max_retries=1,
 )
 
 # --------------------------------------------------------------------------
@@ -200,7 +204,9 @@ def agent_reply(chat_id: int, user_text: str) -> dict:
                 }
             )
 
+        log_event({"chat_id": chat_id, "type": "llm_call_start", "step": step})
         resp = client.chat.completions.create(**kwargs)
+        log_event({"chat_id": chat_id, "type": "llm_call_end", "step": step})
         msg = resp.choices[0].message
 
         tool_calls = getattr(msg, "tool_calls", None)
