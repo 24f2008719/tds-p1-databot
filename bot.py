@@ -110,16 +110,40 @@ TOOLS = [
 _EXEC_GLOBALS_TEMPLATE = {"__name__": "__main__"}
 
 
-def run_python_tool(code: str) -> str:
-    """Execute untrusted-ish analyst code in-process and capture stdout/errors."""
+import concurrent.futures
+
+_TOOL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+PYTHON_TOOL_TIMEOUT_SECONDS = 45
+
+
+def _exec_code(code: str) -> str:
     stdout_buf = io.StringIO()
     g = dict(_EXEC_GLOBALS_TEMPLATE)
     try:
         with contextlib.redirect_stdout(stdout_buf):
             exec(code, g)
-        out = stdout_buf.getvalue()
+        return stdout_buf.getvalue()
     except Exception:
-        out = stdout_buf.getvalue() + "\n" + traceback.format_exc()
+        return stdout_buf.getvalue() + "\n" + traceback.format_exc()
+
+
+def run_python_tool(code: str) -> str:
+    """Execute untrusted-ish analyst code with a hard wall-clock timeout.
+
+    Without this, model-generated code that does e.g. requests.get(url)
+    with no timeout can hang forever on a slow/unresponsive site (common
+    with government data portals), silently stalling the whole chat.
+    """
+    future = _TOOL_EXECUTOR.submit(_exec_code, code)
+    try:
+        out = future.result(timeout=PYTHON_TOOL_TIMEOUT_SECONDS)
+    except concurrent.futures.TimeoutError:
+        out = (
+            f"[execution timed out after {PYTHON_TOOL_TIMEOUT_SECONDS}s — "
+            "the request likely hung on a slow/unresponsive URL. Try a "
+            "different source, add timeout= to requests calls, or answer "
+            "from known public statistics instead.]"
+        )
     if len(out) > MAX_TOOL_OUTPUT_CHARS:
         out = out[-MAX_TOOL_OUTPUT_CHARS:]
     return out
@@ -132,8 +156,10 @@ Rules:
   a multi-turn task (e.g. data sent in an earlier message).
 - Use the run_python tool to fetch and compute answers (pandas, numpy, requests,
   BeautifulSoup, openpyxl are installed). Never guess a number you could compute.
-  If fetching a dataset genuinely fails after reasonable attempts, answer from
-  your own knowledge rather than leaving it blank.
+  ALWAYS pass timeout=15 (or similar) to any requests.get/post call — untimed
+  requests to slow government data portals can hang. If a source is slow or
+  unreachable after one retry, fall back to your own knowledge rather than
+  retrying indefinitely.
 - If the latest message is only a setup message (e.g. "I will send data next")
   and does not itself ask a question, reply with a small JSON acknowledgement
   in the same required shape, using your best-effort placeholder answer field.
