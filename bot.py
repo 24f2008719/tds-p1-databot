@@ -121,6 +121,7 @@ _EXEC_GLOBALS_TEMPLATE = {"__name__": "__main__"}
 import concurrent.futures
 
 _TOOL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+_MESSAGE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=16)
 PYTHON_TOOL_TIMEOUT_SECONDS = 45
 
 
@@ -165,9 +166,12 @@ Rules:
 - Use the run_python tool to fetch and compute answers (pandas, numpy, requests,
   BeautifulSoup, openpyxl are installed). Never guess a number you could compute.
   ALWAYS pass timeout=15 (or similar) to any requests.get/post call — untimed
-  requests to slow government data portals can hang. If a source is slow or
-  unreachable after one retry, fall back to your own knowledge rather than
-  retrying indefinitely.
+  requests to slow government data portals can hang. Prefer fetching a known
+  direct dataset URL (e.g. mospi.gov.in, data.gov.in) over generic search
+  engines like DuckDuckGo/Google, which are often blocked or slow from this
+  server. For well-known published statistics (e.g. official mortality
+  rates, census figures), answer directly from your knowledge rather than
+  spending tool calls searching for something you already know.
 - If the latest message is only a setup message (e.g. "I will send data next")
   and does not itself ask a question, reply with a small JSON acknowledgement
   in the same required shape, using your best-effort placeholder answer field.
@@ -232,8 +236,10 @@ def agent_reply(chat_id: int, user_text: str) -> dict:
                 {
                     "role": "user",
                     "content": (
-                        "Time budget exceeded. Reply NOW with only the final "
-                        "JSON object, best-effort, no tool calls."
+                        "Time budget exceeded — no more tool calls. Reply NOW "
+                        "with the final JSON object in the exact shape "
+                        "requested. Use your best knowledge/estimate for the "
+                        "answer value; do NOT leave it blank or empty."
                     ),
                 }
             )
@@ -387,6 +393,44 @@ def tg_send_message(chat_id: int, text: str):
     return r.json()
 
 
+HARD_HANDLER_TIMEOUT_SECONDS = 280  # stay under the ~300s grader timeout
+
+
+def _handle_message_safe(update: dict):
+    """Wraps handle_message with a hard timeout so a hang anywhere inside
+    (DNS resolution, socket-level stalls, anything that ignores our
+    client-level timeouts) can never prevent a reply being sent."""
+    msg = update.get("message") or update.get("edited_message")
+    if not msg or "text" not in msg:
+        return
+    chat_id = msg["chat"]["id"]
+
+    future = _MESSAGE_EXECUTOR.submit(handle_message, update)
+    try:
+        future.result(timeout=HARD_HANDLER_TIMEOUT_SECONDS)
+    except concurrent.futures.TimeoutError:
+        log_event(
+            {
+                "chat_id": chat_id,
+                "type": "hard_watchdog_timeout",
+                "note": "handle_message exceeded hard timeout; sending fallback reply",
+            }
+        )
+        try:
+            tg_send_message(
+                chat_id,
+                json.dumps({"answer": "internal error: timeout", "log_url": LOG_URL}),
+            )
+        except Exception:
+            log_event(
+                {"chat_id": chat_id, "type": "send_error", "error": traceback.format_exc()}
+            )
+    except Exception:
+        log_event(
+            {"chat_id": chat_id, "type": "handler_error", "error": traceback.format_exc()}
+        )
+
+
 def handle_message(update: dict):
     msg = update.get("message") or update.get("edited_message")
     if not msg or "text" not in msg:
@@ -427,12 +471,12 @@ def telegram_poll_loop():
             updates = tg_get_updates(offset=offset, timeout=30)
             for update in updates:
                 offset = update["update_id"] + 1
-                try:
-                    handle_message(update)
-                except Exception:
-                    log_event(
-                        {"type": "poll_loop_error", "error": traceback.format_exc()}
-                    )
+                # Dispatch each update on its own thread. Without this, one
+                # slow/hanging question blocks the poll loop from consuming
+                # or replying to ANY other message until it resolves.
+                threading.Thread(
+                    target=_handle_message_safe, args=(update,), daemon=True
+                ).start()
         except Exception:
             log_event(
                 {"type": "poll_loop_fatal", "error": traceback.format_exc()}
