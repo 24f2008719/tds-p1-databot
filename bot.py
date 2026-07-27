@@ -204,10 +204,49 @@ Rules:
 - Your FINAL reply (after any tool calls) must be ONLY a single JSON object.
   No markdown code fences, no prose before or after it, nothing else.
 - Match the exact JSON shape requested in the message: correct keys, correct
-  nesting, correct types (string vs number vs list), no extra keys.
+  nesting, correct types (string vs number vs list). CRITICAL: include ONLY
+  the keys explicitly named in the requested shape — nothing more. If the
+  message shows {"answer": {"state": "<state name>"}, ...}, your answer
+  object must contain ONLY the "state" key and no others (no extra
+  explanation fields, no supporting data, no "details", no confidence
+  scores). Grading is exact-match; any extra key is treated as wrong.
 - Always include a "log_url" key in your JSON; any placeholder value you put
   there will be overwritten by the caller with the real log URL.
 """
+
+
+def _extract_requested_schema(user_text: str):
+    """Try to find the JSON shape the question asked for, e.g. a snippet like
+    {"answer": {"state": "<state name>"}, "log_url": "..."} embedded in the
+    question text. Returns the "answer" template (dict/list/etc) or None."""
+    idx = user_text.find('{"answer"')
+    if idx == -1:
+        idx = user_text.find("{'answer'")
+    if idx == -1:
+        return None
+    depth = 0
+    for i in range(idx, len(user_text)):
+        if user_text[i] == "{":
+            depth += 1
+        elif user_text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                snippet = user_text[idx : i + 1]
+                try:
+                    schema = json.loads(snippet)
+                except Exception:
+                    return None
+                return schema.get("answer")
+    return None
+
+
+def _prune_to_schema(value, schema):
+    """If schema is a dict template, keep only keys present in it (one
+    level deep is enough for the shapes this grader uses). Safety net for
+    when the model adds unrequested extra keys despite instructions."""
+    if isinstance(schema, dict) and isinstance(value, dict):
+        return {k: value[k] for k in schema.keys() if k in value}
+    return value
 
 
 def _extract_json(text: str) -> dict:
@@ -423,6 +462,20 @@ def agent_reply(chat_id: int, user_text: str) -> dict:
 
     if "answer" not in parsed:
         parsed = {"answer": parsed}
+
+    schema = _extract_requested_schema(user_text)
+    if schema is not None:
+        pruned_answer = _prune_to_schema(parsed["answer"], schema)
+        if pruned_answer != parsed["answer"]:
+            log_event(
+                {
+                    "chat_id": chat_id,
+                    "type": "answer_pruned_to_schema",
+                    "before": parsed["answer"],
+                    "after": pruned_answer,
+                }
+            )
+        parsed["answer"] = pruned_answer
 
     parsed["log_url"] = LOG_URL
 
