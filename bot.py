@@ -46,6 +46,28 @@ FALLBACK_MODELS = [m.strip() for m in _FALLBACK_ENV.split(",") if m.strip()] or 
 ]
 CANDIDATE_MODELS = [MODEL] + [m for m in FALLBACK_MODELS if m != MODEL]
 
+# Circuit breaker: once a model hits a quota/rate-limit error, skip it for a
+# cooldown period instead of wasting 2 failed attempts on it every step.
+_model_cooldown_until = {}
+_model_cooldown_lock = threading.Lock()
+MODEL_COOLDOWN_SECONDS = 120
+
+
+def _is_quota_error(err: Exception) -> bool:
+    s = str(err)
+    return "429" in s or "RESOURCE_EXHAUSTED" in s or "quota" in s.lower()
+
+
+def _mark_model_cooldown(model_name: str):
+    with _model_cooldown_lock:
+        _model_cooldown_until[model_name] = time.time() + MODEL_COOLDOWN_SECONDS
+
+
+def _model_on_cooldown(model_name: str) -> bool:
+    with _model_cooldown_lock:
+        until = _model_cooldown_until.get(model_name, 0)
+    return time.time() < until
+
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 LOG_PATH = "/tmp/run.jsonl"
 LOG_URL = f"{BASE_URL}/run.jsonl"
@@ -261,6 +283,8 @@ def agent_reply(chat_id: int, user_text: str) -> dict:
         for model_name in CANDIDATE_MODELS:
             if time.time() >= deadline - 5:
                 break
+            if _model_on_cooldown(model_name):
+                continue
             kwargs = dict(kwargs_base, model=model_name)
             for attempt in range(2):  # 2 tries per model before moving on
                 try:
@@ -279,6 +303,9 @@ def agent_reply(chat_id: int, user_text: str) -> dict:
                             "error": str(e),
                         }
                     )
+                    if _is_quota_error(e):
+                        _mark_model_cooldown(model_name)
+                        break  # no point retrying this model again right now
                     remaining = deadline - time.time()
                     if remaining < 10:
                         break
@@ -512,10 +539,18 @@ def telegram_poll_loop():
                     target=_handle_message_safe, args=(update,), daemon=True
                 ).start()
         except Exception:
-            log_event(
-                {"type": "poll_loop_fatal", "error": traceback.format_exc()}
-            )
-            time.sleep(5)
+            err_str = traceback.format_exc()
+            is_conflict = "409" in err_str and "Conflict" in err_str
+            # 409 means another process is polling this same bot token
+            # (e.g. a leftover instance from a previous deploy). Back off
+            # longer and only log occasionally instead of spamming every 5s.
+            if is_conflict:
+                if int(time.time()) % 60 < 12:  # log roughly once a minute
+                    log_event({"type": "poll_loop_conflict", "error": err_str})
+                time.sleep(15)
+            else:
+                log_event({"type": "poll_loop_fatal", "error": err_str})
+                time.sleep(5)
 
 
 def keep_alive_loop():
