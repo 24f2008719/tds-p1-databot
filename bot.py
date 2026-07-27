@@ -231,26 +231,35 @@ def agent_reply(chat_id: int, user_text: str) -> dict:
             )
 
         log_event({"chat_id": chat_id, "type": "llm_call_start", "step": step})
-        resp = client.chat.completions.create(**kwargs)
+        try:
+            resp = client.chat.completions.create(**kwargs)
+        except Exception:
+            log_event(
+                {
+                    "chat_id": chat_id,
+                    "type": "llm_call_error",
+                    "step": step,
+                    "error": traceback.format_exc(),
+                }
+            )
+            final_text = '{"answer": "internal error: llm call failed"}'
+            break
         log_event({"chat_id": chat_id, "type": "llm_call_end", "step": step})
         msg = resp.choices[0].message
 
         tool_calls = getattr(msg, "tool_calls", None)
         if tool_calls and use_tools:
+            # Round-trip the tool_calls exactly as returned (model_dump preserves
+            # provider-specific extra fields, e.g. Gemini's required
+            # extra_content.google.thought_signature). Rebuilding this dict by
+            # hand drops that field and Gemini rejects the next turn with
+            # "Function call is missing a thought_signature".
             messages.append(
                 {
                     "role": "assistant",
                     "content": msg.content,
                     "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.function.name,
-                                "arguments": tc.function.arguments,
-                            },
-                        }
-                        for tc in tool_calls
+                        tc.model_dump(exclude_none=True) for tc in tool_calls
                     ],
                 }
             )
