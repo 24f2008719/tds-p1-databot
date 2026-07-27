@@ -122,7 +122,7 @@ import concurrent.futures
 
 _TOOL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 _MESSAGE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=16)
-PYTHON_TOOL_TIMEOUT_SECONDS = 45
+PYTHON_TOOL_TIMEOUT_SECONDS = 15
 
 
 def _exec_code(code: str) -> str:
@@ -168,10 +168,14 @@ Rules:
   ALWAYS pass timeout=15 (or similar) to any requests.get/post call — untimed
   requests to slow government data portals can hang. Prefer fetching a known
   direct dataset URL (e.g. mospi.gov.in, data.gov.in) over generic search
-  engines like DuckDuckGo/Google, which are often blocked or slow from this
-  server. For well-known published statistics (e.g. official mortality
-  rates, census figures), answer directly from your knowledge rather than
-  spending tool calls searching for something you already know.
+  engines like DuckDuckGo/Google/Wikipedia — these are frequently blocked or
+  unreachable from this server and repeatedly retrying them wastes your whole
+  time budget. STRICT RULE: if a fetch attempt fails or times out, you get
+  ONE retry with a different approach at most — if that also fails, STOP
+  trying to fetch and immediately answer from your own knowledge instead.
+  For well-known published statistics (e.g. official mortality rates, census
+  figures, economic indicators), just answer directly from knowledge —
+  don't spend tool calls searching for something you already know.
 - If the latest message is only a setup message (e.g. "I will send data next")
   and does not itself ask a question, reply with a small JSON acknowledgement
   in the same required shape, using your best-effort placeholder answer field.
@@ -224,7 +228,7 @@ def agent_reply(chat_id: int, user_text: str) -> dict:
     final_text = None
     for step in range(MAX_TOOL_STEPS):
         time_left = deadline - time.time()
-        use_tools = time_left > 15  # leave headroom to force a final answer
+        use_tools = time_left > 30  # leave more headroom to force a final answer
 
         kwargs_base = dict(messages=messages)
         if use_tools:
@@ -278,7 +282,7 @@ def agent_reply(chat_id: int, user_text: str) -> dict:
                     remaining = deadline - time.time()
                     if remaining < 10:
                         break
-                    time.sleep(min(4 * (attempt + 1), remaining - 5))
+                    time.sleep(min(2 * (attempt + 1), remaining - 5))
             if resp is not None:
                 if model_name != MODEL:
                     log_event(
@@ -296,12 +300,42 @@ def agent_reply(chat_id: int, user_text: str) -> dict:
                     "chat_id": chat_id,
                     "type": "llm_call_error",
                     "step": step,
-                    "error": traceback.format_exc()
+                    "reason": "no_time_left_for_normal_attempt"
                     if last_err is None
                     else repr(last_err),
                 }
             )
-            final_text = '{"answer": "internal error: llm call failed"}'
+            # Last resort: one bare, tight-timeout, tools-off attempt so we
+            # still have a shot at a real answer instead of an error string.
+            try:
+                rescue_resp = client.chat.completions.create(
+                    model=CANDIDATE_MODELS[0],
+                    messages=messages
+                    + [
+                        {
+                            "role": "user",
+                            "content": (
+                                "Answer immediately with ONLY the final JSON "
+                                "object requested, using your best knowledge. "
+                                "No tools, no further delay."
+                            ),
+                        }
+                    ],
+                    timeout=20.0,
+                )
+                final_text = rescue_resp.choices[0].message.content or ""
+                log_event(
+                    {"chat_id": chat_id, "type": "rescue_call_succeeded", "step": step}
+                )
+            except Exception:
+                log_event(
+                    {
+                        "chat_id": chat_id,
+                        "type": "rescue_call_failed",
+                        "error": traceback.format_exc(),
+                    }
+                )
+                final_text = '{"answer": "internal error: llm call failed"}'
             break
         log_event({"chat_id": chat_id, "type": "llm_call_end", "step": step})
         msg = resp.choices[0].message
